@@ -394,26 +394,81 @@ def is_running(status: str) -> bool:
 # ---------------------------------------------------------------------------
 # Browser helpers
 # ---------------------------------------------------------------------------
-def click_anywhere(page, texts, timeout_ms, exact=True):
+def click_anywhere(page, texts, timeout_ms, exact=True, force=False):
+    """在所有 frame 里找文本并点击；兼容 button / div / 跨域 iframe。"""
+    deadline = time.time() + timeout_ms / 1000
+    while time.time() < deadline:
+        frames = list(page.frames)
+        for frame in frames:
+            for t in texts:
+                selectors = []
+                if exact:
+                    selectors.extend(
+                        [
+                            lambda t=t, f=frame: f.get_by_role("button", name=t, exact=True).first,
+                            lambda t=t, f=frame: f.get_by_text(t, exact=True).first,
+                            lambda t=t, f=frame: f.locator(f"button:text-is('{t}')").first,
+                            lambda t=t, f=frame: f.locator(f"text={t}").first,
+                        ]
+                    )
+                selectors.extend(
+                    [
+                        lambda t=t, f=frame: f.get_by_role("button", name=t, exact=False).first,
+                        lambda t=t, f=frame: f.get_by_text(t, exact=False).first,
+                        lambda t=t, f=frame: f.locator(f"button:has-text('{t}')").first,
+                        lambda t=t, f=frame: f.locator(f"[role=button]:has-text('{t}')").first,
+                        lambda t=t, f=frame: f.locator(f"div:has-text('{t}')").first,
+                        lambda t=t, f=frame: f.locator(f"span:has-text('{t}')").first,
+                        lambda t=t, f=frame: f.locator(f"a:has-text('{t}')").first,
+                    ]
+                )
+                for maker in selectors:
+                    try:
+                        loc = maker()
+                        n = loc.count()
+                        if not n:
+                            continue
+                        # 可见则点；不可见但 force 时也试
+                        visible = False
+                        try:
+                            visible = loc.is_visible()
+                        except Exception:
+                            visible = False
+                        if visible or force:
+                            try:
+                                loc.click(timeout=4000, force=force)
+                            except Exception:
+                                # 退回 JS 点击
+                                try:
+                                    loc.evaluate("el => el.click()")
+                                except Exception:
+                                    continue
+                            return f"{t}@{frame.url[:70]}"
+                    except Exception:
+                        pass
+        time.sleep(1.0)
+    return None
+
+
+def wait_for_any_text(page, texts, timeout_ms) -> str | None:
+    """等待任意文案出现在任意 frame，返回命中文本。"""
     deadline = time.time() + timeout_ms / 1000
     while time.time() < deadline:
         for frame in page.frames:
             for t in texts:
-                makers = [
-                    lambda t=t, f=frame: f.get_by_role("button", name=t, exact=exact).first,
-                    lambda t=t, f=frame: f.get_by_text(t, exact=exact).first,
-                    lambda t=t, f=frame: f.locator(f"button:has-text('{t}')").first,
-                    lambda t=t, f=frame: f.locator(f"[role=button]:has-text('{t}')").first,
-                ]
-                for maker in makers:
-                    try:
-                        loc = maker()
-                        if loc.count() and loc.is_visible():
-                            loc.click(timeout=3000)
-                            return f"{t}@{frame.url[:60]}"
-                    except Exception:
-                        pass
-        time.sleep(1.2)
+                try:
+                    loc = frame.get_by_text(t, exact=False).first
+                    if loc.count() and loc.is_visible():
+                        return t
+                except Exception:
+                    pass
+                try:
+                    loc = frame.locator(f"text={t}").first
+                    if loc.count() and loc.is_visible():
+                        return t
+                except Exception:
+                    pass
+        time.sleep(1.0)
     return None
 
 
@@ -482,42 +537,62 @@ def open_panel(page, url: str):
 
 def watch_reward_ads(page, cfg, reason: str = "广告") -> int:
     """
-    观看激励广告流程。
-    返回成功点击并等待的广告数量。
+    观看激励广告流程（开机 / 续期共用）。
+    UI 实际文案示例：
+      - "Watch 3 ads to start your free server"
+      - "Ad ready."
+      - 绿色按钮 "Watch ad"
+    返回成功处理的广告数量。
     """
     total = int(cfg["ads_per_extension"])
     duration = int(cfg["ad_duration_sec"])
     watched = 0
 
-    # 可能先出现「观看广告」确认按钮
-    hit = click_anywhere(page, WATCH_CONFIRM_LABELS, 20000)
-    if not hit:
-        hit = click_anywhere(page, WATCH_CONFIRM_LABELS, 15000, exact=False)
-    if hit:
-        log(f"[{reason}] 已点击观看确认: {hit}")
+    # 等待广告弹层出现
+    ready = wait_for_any_text(
+        page,
+        ["Ad ready", "Watch ad", "Watch 3 ads", "Rewarded ad", "觀看廣告", "观看广告"],
+        45000,
+    )
+    if ready:
+        log(f"[{reason}] 检测到广告界面: {ready!r}")
     else:
-        log(f"[{reason}] 未找到观看确认按钮（可能已在广告流程中）")
-
-    log(f"[{reason}] 等待 Ad ready…")
-    page.wait_for_timeout(6000)
+        log(f"[{reason}] 未检测到广告界面文案，仍尝试点击 Watch ad")
 
     for i in range(1, total + 1):
-        hit = click_anywhere(page, WATCH_AD_LABELS, 75000)
+        # 每一轮先等 Ad ready（除了可能已经 ready）
+        if i > 1:
+            wait_for_any_text(page, ["Ad ready", "Watch ad", "Rewarded ad"], 60000)
+
+        hit = click_anywhere(page, WATCH_AD_LABELS, 90000, exact=False)
         if not hit:
-            hit = click_anywhere(page, WATCH_AD_LABELS, 20000, exact=False)
+            # 强制再试一轮（有的节点 visible 判定失败）
+            hit = click_anywhere(page, WATCH_AD_LABELS, 30000, exact=False, force=True)
         if not hit:
             log(f"[{reason}] 第 {i}/{total} 个 Watch ad 未找到，停止")
+            # 打印当前 frames 帮助诊断
+            try:
+                log(f"[{reason}] 当前 frames 数: {len(page.frames)}")
+                for fr in page.frames[:12]:
+                    log(f"  frame: {fr.url[:90]}")
+            except Exception:
+                pass
             break
-        log(f"[{reason}] 已点击第 {i}/{total} 个 Watch ad（{hit}），播放中…")
+
+        log(f"[{reason}] 已点击第 {i}/{total} 个 Watch ad（{hit}），播放中 {duration}s…")
         page.wait_for_timeout(duration * 1000)
-        closed = click_anywhere(page, CLOSE_AD_LABELS, 60000)
+
+        closed = click_anywhere(page, CLOSE_AD_LABELS, 60000, exact=False)
+        if not closed:
+            closed = click_anywhere(page, CLOSE_AD_LABELS, 15000, exact=False, force=True)
         log(
             f"[{reason}] 第 {i} 个广告: "
             + (f"已关闭（{closed}）" if closed else "未找到 Close（可能自动关闭）")
         )
         watched += 1
-        page.wait_for_timeout(5000)
+        page.wait_for_timeout(6000)
 
+    log(f"[{reason}] 本轮共处理 {watched}/{total} 个广告")
     return watched
 
 
@@ -542,7 +617,8 @@ def wait_until_running(cfg, timeout_sec=120) -> dict | None:
 
 def try_power_on(page, cfg) -> tuple[bool, dict | None]:
     """
-    尝试开机。若界面要求看广告，则走广告流程。
+    尝试开机。免费档关机后点 Start 会弹出：
+      "Watch 3 ads to start your free server" → Watch ad × 3
     返回 (是否已变为 running, 最新 state)。
     """
     state = api_state(cfg)
@@ -557,33 +633,32 @@ def try_power_on(page, cfg) -> tuple[bool, dict | None]:
         log(f"状态既非 running 也非明确 stopped（{st}），仍尝试寻找开机按钮")
 
     log("正在寻找开机按钮…")
-    hit = click_anywhere(page, POWER_ON_LABELS, 40000)
+    # RESUME 有时也会出现在会话恢复场景
+    labels = POWER_ON_LABELS + ["RESUME", "Resume", "恢复"]
+    hit = click_anywhere(page, labels, 40000)
     if not hit:
-        hit = click_anywhere(page, POWER_ON_LABELS, 20000, exact=False)
+        hit = click_anywhere(page, labels, 20000, exact=False, force=True)
     if not hit:
         log("未找到开机按钮")
         dump_page_debug(page, "找不到开机按钮")
-        # 有时关机是因为会话到期，先尝试续期入口
         return False, state
 
     log(f"已点击开机: {hit}")
-    page.wait_for_timeout(3000)
+    page.wait_for_timeout(4000)
 
-    # 开机后可能立刻弹出广告流程
-    ad_hint = click_anywhere(page, WATCH_CONFIRM_LABELS + WATCH_AD_LABELS, 8000)
-    if ad_hint or any(
-        x in (hit or "") for x in ("广告", "廣告", "Watch", "ad")
-    ):
-        log("开机流程似乎需要看广告，开始模拟观看…")
-        watch_reward_ads(page, cfg, reason="开机广告")
-    else:
-        # 再扫一次确认按钮（延迟出现）
-        page.wait_for_timeout(2000)
-        if click_anywhere(page, WATCH_CONFIRM_LABELS, 5000):
-            log("检测到延迟出现的广告确认，开始观看…")
-            watch_reward_ads(page, cfg, reason="开机广告")
+    # 开机几乎总会要求看 3 个广告（截图已确认 UI）
+    log("开始处理开机广告（Watch 3 ads to start）…")
+    watched = watch_reward_ads(page, cfg, reason="开机广告")
+    if watched < 1:
+        log("开机广告一个都没点到，尝试再点一次 Start 后重试")
+        click_anywhere(page, labels, 10000, exact=False, force=True)
+        page.wait_for_timeout(3000)
+        watched = watch_reward_ads(page, cfg, reason="开机广告-重试")
 
-    new_state = wait_until_running(cfg, timeout_sec=150)
+    if watched < int(cfg["ads_per_extension"]):
+        log(f"警告: 仅完成 {watched}/{cfg['ads_per_extension']} 个开机广告")
+
+    new_state = wait_until_running(cfg, timeout_sec=180)
     if new_state and is_running(new_state.get("status")):
         log(f"开机成功 → status={new_state.get('status')}")
         return True, new_state
@@ -752,14 +827,16 @@ def main():
 
             # 2) 会话续期（默认总是尝试；可用环境变量跳过）
             skip_extend = os.environ.get("VOER_SKIP_EXTEND", "").strip() in ("1", "true", "yes")
+            try:
+                before = api_state(cfg)
+            except Exception:
+                pass
+            today_ext = int(before.get("sessionExtensionsToday") or 0)
             if skip_extend:
                 log("已设置 VOER_SKIP_EXTEND，跳过续期")
+            elif power_ok is False and today_ext >= 4:
+                log("开机未成功且今日续期已达上限，跳过续期步骤（避免无效点击）")
             else:
-                # 刷新 before，避免开机过程中状态已变
-                try:
-                    before = api_state(cfg)
-                except Exception:
-                    pass
                 extend_ok, after = try_extend_session(page, cfg, before)
 
             shot = take_screenshot(page, "renew_screenshot.png")
