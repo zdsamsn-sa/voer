@@ -43,7 +43,7 @@ DEFAULT_CONFIG = {
     "server_id": "在这里填服务器 UUID（面板地址 /panel/server/ 后面那串）",
     "token": "在这里填浏览器 Cookie 里 voer.host 的 token 值（JWT）",
     "ads_per_extension": 3,
-    "ad_duration_sec": 32,
+    "ad_duration_sec": 35,
     "headless": False,
     "use_system_chrome": False,
     "telegram_bot_token": "",
@@ -472,6 +472,49 @@ def wait_for_any_text(page, texts, timeout_ms) -> str | None:
     return None
 
 
+
+def _is_ad_frame_url(url: str) -> bool:
+    u = (url or "").lower()
+    keys = (
+        "wormies",
+        "doubleclick",
+        "googleads",
+        "googlesyndication",
+        "pagead",
+        "adservice",
+        "voer-ads",
+        "about:blank",
+    )
+    return any(k in u for k in keys)
+
+
+def click_close_ad_only(page, timeout_ms=60000):
+    """只在广告相关 iframe 里点 Close，避免关掉主面板的「Watch 3 ads」弹窗。"""
+    labels = CLOSE_AD_LABELS
+    deadline = time.time() + timeout_ms / 1000
+    while time.time() < deadline:
+        for frame in page.frames:
+            if not _is_ad_frame_url(frame.url):
+                # 主站 panel 上的 Close 很危险（会关整个广告流程弹窗）
+                if "voer.host" in (frame.url or "").lower():
+                    continue
+            for t in labels:
+                for maker in (
+                    lambda t=t, f=frame: f.get_by_role("button", name=t, exact=False).first,
+                    lambda t=t, f=frame: f.get_by_text(t, exact=False).first,
+                    lambda t=t, f=frame: f.locator(f"button:has-text('{t}')").first,
+                ):
+                    try:
+                        loc = maker()
+                        if loc.count() and loc.is_visible():
+                            loc.click(timeout=3000)
+                            return f"{t}@{frame.url[:70]}"
+                    except Exception:
+                        pass
+        time.sleep(1.0)
+    return None
+
+
 def dismiss_banners(page):
     for t in ACCEPT_LABELS:
         hit = click_anywhere(page, [t], 2500)
@@ -582,15 +625,24 @@ def watch_reward_ads(page, cfg, reason: str = "广告") -> int:
         log(f"[{reason}] 已点击第 {i}/{total} 个 Watch ad（{hit}），播放中 {duration}s…")
         page.wait_for_timeout(duration * 1000)
 
-        closed = click_anywhere(page, CLOSE_AD_LABELS, 60000, exact=False)
-        if not closed:
-            closed = click_anywhere(page, CLOSE_AD_LABELS, 15000, exact=False, force=True)
+        # 重要：绝不能点主页面弹窗右上角 Close，否则会中断整个 3 次广告流程
+        closed = click_close_ad_only(page, timeout_ms=45000)
         log(
             f"[{reason}] 第 {i} 个广告: "
-            + (f"已关闭（{closed}）" if closed else "未找到 Close（可能自动关闭）")
+            + (f"已关闭（{closed}）" if closed else "未找到广告 iframe Close（可能自动关闭）")
         )
         watched += 1
-        page.wait_for_timeout(6000)
+        # 等下一轮 Ad ready / Watch ad 出现
+        page.wait_for_timeout(4000)
+        nxt = wait_for_any_text(
+            page,
+            ["Ad ready", "Watch ad", "Rewarded ad", "Watch 3 ads"],
+            50000,
+        )
+        if nxt:
+            log(f"[{reason}] 下一轮界面: {nxt!r}")
+        else:
+            log(f"[{reason}] 等待下一轮广告界面超时（若已是最后一轮可忽略）")
 
     log(f"[{reason}] 本轮共处理 {watched}/{total} 个广告")
     return watched
@@ -655,10 +707,14 @@ def try_power_on(page, cfg) -> tuple[bool, dict | None]:
         page.wait_for_timeout(3000)
         watched = watch_reward_ads(page, cfg, reason="开机广告-重试")
 
-    if watched < int(cfg["ads_per_extension"]):
-        log(f"警告: 仅完成 {watched}/{cfg['ads_per_extension']} 个开机广告")
+    need = int(cfg["ads_per_extension"])
+    if watched < need:
+        log(f"警告: 仅完成 {watched}/{need} 个开机广告，尝试补看剩余…")
+        extra = watch_reward_ads(page, cfg, reason="开机广告-补看")
+        watched += extra
+        log(f"补看后合计: {watched}/{need}")
 
-    new_state = wait_until_running(cfg, timeout_sec=180)
+    new_state = wait_until_running(cfg, timeout_sec=240)
     if new_state and is_running(new_state.get("status")):
         log(f"开机成功 → status={new_state.get('status')}")
         return True, new_state
