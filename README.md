@@ -14,8 +14,10 @@
 本项目提供：
 
 1. **本地 / VPS** 直接运行的 Python 脚本（Playwright）
-2. **GitHub Actions** 定时/手动续期（推荐）
-3. **Telegram** 续期结果通知 + 面板截图（可选）
+2. **检测关机并自动开机**（若需看广告则自动模拟观看）
+3. **会话续期**（看 3 个激励广告，+4 小时）
+4. **GitHub Actions** 定时/手动运行（推荐）
+5. **Telegram** 结果通知 + 面板截图（可选）
 
 ---
 
@@ -197,8 +199,9 @@ export TELEGRAM_CHAT_ID='123456789'
 2. 左侧选择 **Voer.host 会话续期**
 3. 点 **Run workflow**
 4. 选择模式：
-   - `status`：只查看当前到期时间、今日已续次数（**不消耗广告**）
-   - `renew`：真正看广告续期
+   - `status`：只查看状态（**不消耗广告**）
+   - `power-on`：只尝试开机（关机时；可能需要看广告）
+   - `renew`：若关机则开机，再看广告做会话续期（默认推荐）
 5. **第一次务必先跑 `status`**，确认 Secrets 正确、token 未过期
 6. 再跑 `renew`，等待约 3～5 分钟
 
@@ -278,8 +281,11 @@ cp config.example.json config.json
 # 只看状态（不看广告、不消耗次数）
 python3 voer_renew.py --status
 
-# 真正续期（必须带虚拟显示）
+# 默认：若关机则开机，然后会话续期（必须带虚拟显示）
 xvfb-run -a python3 voer_renew.py
+
+# 只尝试开机（已运行则跳过；开机若需广告会自动看）
+xvfb-run -a python3 voer_renew.py --power-on
 ```
 
 > `headless` 必须为 `false`，且要用 `xvfb-run`。纯无头模式下广告不会发奖励。
@@ -338,7 +344,14 @@ TimeoutError: waiting for get_by_role("button", name="延伸")
 新版已兼容多种文案（延伸 / 延长 / 續期 / Extend / Renew 等）。  
 若仍失败，日志会打印「可见按钮/链接文字」并保存截图，把列表发出来即可继续适配。
 
-### 3. 「未检测到续期生效」
+### 3. 关机无法自动开机
+
+脚本根据 API 的 `status` 判断是否关机，并点击「开机 / Start / Power on」等按钮。  
+若日志出现「未找到开机按钮」，会打印页面可见按钮列表并截图——把列表发出来可继续适配文案。
+
+开机若弹出与续期相同的激励广告，会自动走同一套「Watch ad → 等待 → Close」流程。
+
+### 4. 「未检测到续期生效」
 
 可能原因：
 
