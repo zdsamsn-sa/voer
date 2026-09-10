@@ -35,7 +35,8 @@ on:
         default: "renew"
         type: choice
         options:
-          - renew      # 真正续期（看广告）
+          - renew      # 开机(如需) + 续期（看广告）
+          - power-on   # 只尝试开机（关机时；可能看广告）
           - status     # 只查看当前状态，不消耗广告次数
 
   # 定时任务（UTC 时间）
@@ -132,6 +133,18 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           xvfb-run -a python3 voer_renew.py --status
+
+
+      - name: 只尝试开机
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'power-on'
+        env:
+          VOER_SERVER_ID: ${{ secrets.VOER_SERVER_ID }}
+          VOER_TOKEN: ${{ secrets.VOER_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          echo "尝试开机（若已运行则跳过）..."
+          xvfb-run -a python3 voer_renew.py --power-on
 
       - name: 执行续期（看 3 个广告）
         if: |
