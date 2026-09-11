@@ -26,7 +26,7 @@ on:
 
   schedule:
     # 会被「更新下次运行 Cron」步骤按 session 到期时间自动改写
-    - cron: "53 16 11 9 *"  # auto next: 2026-09-11T16:53:00Z UTC
+    - cron: "38 22 11 9 *"  # auto next: 2026-09-11T22:38:00Z UTC
 
 concurrency:
   group: voer-renew
