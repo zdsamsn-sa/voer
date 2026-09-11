@@ -1,28 +1,3 @@
-# Voer.host 免费服务器自动续期
-# 每天自动看 3 个激励广告，把会话延长 +4 小时
-#
-# 使用前必须在仓库 Settings → Secrets and variables → Actions 里添加：
-#   VOER_SERVER_ID   = 服务器 UUID
-#   VOER_TOKEN          = Cookie 中的 token（JWT）
-#   TELEGRAM_BOT_TOKEN  = （可选）Telegram Bot Token，用于续期结果通知+截图
-#   TELEGRAM_CHAT_ID    = （可选）Telegram Chat ID
-#
-# 如何获取这两个值（非常重要）：
-# 1. 浏览器登录 https://voer.host
-# 2. 打开你的服务器面板，地址栏类似：
-#    https://voer.host/panel/server/58d72957-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-#    → 把最后一串 UUID 复制，就是 VOER_SERVER_ID
-# 3. 按 F12 打开开发者工具 → Application（应用）标签
-#    → 左侧 Cookies → 点击 voer.host
-#    → 找到 name = token 那一行，复制 Value（以 eyJ 开头的长字符串）
-#    → 这就是 VOER_TOKEN（大约 7 天有效，过期后重新复制一次即可）
-#
-# 限制提醒：
-# - 每 UTC 日最多续期 4 次
-# - 每个会话最多续期 4 次
-# - 每次成功 +4 小时
-# - headless 模式下广告不会发奖励，所以必须用 xvfb + headless=false
-
 name: Voer.host 会话续期
 
 on:
