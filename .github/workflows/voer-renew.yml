@@ -5,6 +5,7 @@
 #   VOER_TOKEN             必须
 #   TELEGRAM_BOT_TOKEN     可选
 #   TELEGRAM_CHAT_ID       可选
+#   GH_PAT                 可选但推荐：PAT，勾选 repo + workflow，用于自动推送 cron
 #
 # 还需要: Settings → Actions → General → Workflow permissions → Read and write
 
@@ -25,7 +26,7 @@ on:
 
   schedule:
     # 会被「更新下次运行 Cron」步骤按 session 到期时间自动改写
-    - cron: "0 0,8,16 * * *"
+    - cron: "0 */2 * * *"   # 每 2 小时；成功续期后会改成「到期前 45 分钟」
 
 concurrency:
   group: voer-renew
@@ -43,7 +44,8 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # 若配置了 GH_PAT（需 workflow 权限）则用它推送 cron；否则用默认 token
+          token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
           persist-credentials: true
 
       - name: 设置 Python
@@ -229,5 +231,24 @@ jobs:
             exit 0
           fi
           git commit -m "chore: auto cron next run ${NEXT_RUN_UTC}"
+
+          # 默认 GITHUB_TOKEN 不能改 workflow 文件，需要 PAT（secret 名: GH_PAT）
+          set +e
           git push
-          echo "Cron 已推送"
+          PUSH_RC=$?
+          set -e
+          if [ "$PUSH_RC" -eq 0 ]; then
+            echo "✅ Cron 已推送"
+          else
+            echo ""
+            echo "⚠️  git push 失败（常见原因：默认 GITHUB_TOKEN 无 workflows 权限）"
+            echo "解决办法："
+            echo "  1. GitHub → Settings → Developer settings → Personal access tokens"
+            echo "     新建 token，勾选 repo + workflow"
+            echo "  2. 仓库 Secrets 新增 GH_PAT = 该 token"
+            echo "  3. 重新跑一次成功续期即可自动推送 cron"
+            echo ""
+            echo "本次续期本身已成功，不受影响。将使用默认 schedule 或请手动改 cron。"
+            # 不让整个 job 失败
+            exit 0
+          fi
