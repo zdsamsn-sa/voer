@@ -59,6 +59,9 @@ jobs:
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: true
 
       - name: 设置 Python
         uses: actions/setup-python@v5
@@ -135,18 +138,9 @@ jobs:
           xvfb-run -a python3 voer_renew.py --status
 
 
-      - name: 只尝试开机
-        if: github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'power-on'
-        env:
-          VOER_SERVER_ID: ${{ secrets.VOER_SERVER_ID }}
-          VOER_TOKEN: ${{ secrets.VOER_TOKEN }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          echo "尝试开机（若已运行则跳过）..."
-          xvfb-run -a python3 voer_renew.py --power-on
 
       - name: 执行续期（看 3 个广告）
+        id: renew
         if: |
           github.event_name == 'schedule' ||
           (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'renew')
@@ -155,13 +149,27 @@ jobs:
           VOER_TOKEN: ${{ secrets.VOER_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          # 可选：覆盖默认值
+          VOER_NEXT_RUN_LEAD_MINUTES: "45"
           # VOER_ADS_PER_EXTENSION: "3"
-          # VOER_AD_DURATION_SEC: "35"
+          # VOER_AD_DURATION_SEC: "45"
         run: |
           echo "开始续期，预计 3～5 分钟..."
-          xvfb-run -a python3 voer_renew.py
+          set -o pipefail
+          xvfb-run -a python3 voer_renew.py 2>&1 | tee renew_output.log
           echo "脚本执行完毕，请查看上方日志是否显示「续期成功」"
+
+      - name: 只尝试开机
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'power-on'
+        env:
+          VOER_SERVER_ID: ${{ secrets.VOER_SERVER_ID }}
+          VOER_TOKEN: ${{ secrets.VOER_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          VOER_NEXT_RUN_LEAD_MINUTES: "45"
+        run: |
+          echo "尝试开机（若已运行则跳过）..."
+          set -o pipefail
+          xvfb-run -a python3 voer_renew.py --power-on 2>&1 | tee renew_output.log
 
       - name: 上传失败截图（如有）
         if: failure()
@@ -174,7 +182,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: 续期后再次确认状态
-        if: always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'renew'))
+        if: always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (github.event.inputs.mode == 'renew' || github.event.inputs.mode == 'power-on')))
         env:
           VOER_SERVER_ID: ${{ secrets.VOER_SERVER_ID }}
           VOER_TOKEN: ${{ secrets.VOER_TOKEN }}
@@ -183,3 +191,98 @@ jobs:
         run: |
           echo "----- 当前服务器状态 -----"
           xvfb-run -a python3 voer_renew.py --status || true
+
+      - name: 更新下次运行 Cron（根据到期时间）
+        if: success()
+        run: |
+          set -e
+          WF=".github/workflows/voer-renew.yml"
+          if [ ! -f next_run.txt ]; then
+            # 尝试从日志解析
+            if [ -f renew_output.log ]; then
+              grep -o 'NEXT_RUN_UTC=[0-9T:Z-]*' renew_output.log | tail -1 > next_run.txt || true
+              CRON_LINE=$(grep -o 'cron: [0-9* ].*' renew_output.log | tail -1 | sed 's/.*cron: //' || true)
+              if [ -n "$CRON_LINE" ]; then
+                echo "NEXT_RUN_CRON=$CRON_LINE" >> next_run.txt
+              fi
+            fi
+          fi
+          if [ ! -f next_run.txt ]; then
+            echo "无 next_run.txt，跳过 cron 更新（可能未续期成功或无到期时间）"
+            exit 0
+          fi
+          echo "----- next_run.txt -----"
+          cat next_run.txt
+          NEXT_RUN_UTC=$(grep '^NEXT_RUN_UTC=' next_run.txt | cut -d= -f2)
+          NEXT_RUN_CRON=$(grep '^NEXT_RUN_CRON=' next_run.txt | cut -d= -f2)
+          if [ -z "$NEXT_RUN_UTC" ] || [ -z "$NEXT_RUN_CRON" ]; then
+            echo "NEXT_RUN 字段不完整，跳过"
+            exit 0
+          fi
+          echo "下次运行时间 (UTC): $NEXT_RUN_UTC"
+          echo "新 cron: $NEXT_RUN_CRON"
+
+          # 替换 schedule 里的 cron 行（保留 workflow_dispatch）
+          python3 - <<'PY'
+          import pathlib, re
+          wf = pathlib.Path(".github/workflows/voer-renew.yml")
+          text = wf.read_text(encoding="utf-8")
+          nxt = pathlib.Path("next_run.txt").read_text(encoding="utf-8")
+          cron = None
+          iso = None
+          for line in nxt.splitlines():
+              if line.startswith("NEXT_RUN_CRON="):
+                  cron = line.split("=", 1)[1].strip()
+              if line.startswith("NEXT_RUN_UTC="):
+                  iso = line.split("=", 1)[1].strip()
+          if not cron:
+              raise SystemExit("no cron")
+          # 替换第一个 schedule cron
+          new_text, n = re.subn(
+              r'(schedule:\s*
+\s*-\s*cron:\s*")([^"]+)(")',
+              lambda m: f'{m.group(1)}{cron}{m.group(3)}',
+              text,
+              count=1,
+          )
+          if n != 1:
+              # 尝试 YAML 单引号
+              new_text, n = re.subn(
+                  r"(schedule:\s*
+\s*-\s*cron:\s*')([^']+)(')",
+                  lambda m: f"{m.group(1)}{cron}{m.group(3)}",
+                  text,
+                  count=1,
+              )
+          if n != 1:
+              raise SystemExit(f"failed to patch cron, n={n}")
+          # 在 cron 行后加注释
+          new_text = re.sub(
+              r'(-\s*cron:\s*"' + re.escape(cron) + r'")',
+              r'   # auto: next run ' + (iso or "") + " UTC",
+              new_text,
+              count=1,
+          )
+          if new_text == text:
+              print("cron 未变化，无需提交")
+              pathlib.Path("/tmp/cron_changed").write_text("0")
+          else:
+              wf.write_text(new_text, encoding="utf-8")
+              pathlib.Path("/tmp/cron_changed").write_text("1")
+              print("已写入新 cron 到", wf)
+          print("找到工作流文件:", wf)
+          print(f"[auto] 下次执行时间: {iso} UTC")
+          print(f"新 cron: {cron}")
+          PY
+
+          if [ "$(cat /tmp/cron_changed 2>/dev/null || echo 0)" != "1" ]; then
+            echo "无需推送"
+            exit 0
+          fi
+          git config user.name "voer-renew-bot"
+          git config user.email "voer-renew-bot@users.noreply.github.com"
+          git add "$WF"
+          git diff --cached --quiet && echo "无变更" && exit 0
+          git commit -m "chore: 自动更新下次续期 cron → ${NEXT_RUN_UTC}"
+          git push
+          echo "✅ Cron 已自动更新并推送"
