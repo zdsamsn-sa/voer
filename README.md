@@ -403,5 +403,15 @@ TimeoutError: waiting for get_by_role("button", name="延伸")
 
 ---
 
-## 免责声明: 本脚本仅供学习交流与自动化技术研究使用，请合理设置请求频率，遵守服务商的 TOS（服务条款）。
+## 快速检查清单
 
+首次使用建议按此顺序：
+
+- [ ] 拿到 `VOER_SERVER_ID`（面板 URL 末尾 UUID）
+- [ ] 拿到 `VOER_TOKEN`（Cookie 里 name=`token` 的完整 JWT）
+- [ ] （可选）创建 TG Bot，拿到 `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`
+- [ ] 写入 GitHub Secrets 或本地环境变量
+- [ ] 推送本项目全部文件到仓库
+- [ ] Actions 先跑 **`status`**，确认能读到到期时间
+- [ ] 再跑 **`renew`**，确认日志出现「续期成功」
+- [ ] （若配置了 TG）手机收到成功通知和截图

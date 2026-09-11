@@ -98,10 +98,13 @@ POWER_ON_LABELS = [
 
 EXTEND_LABELS = [
     "延伸",
+    "+ 延伸",
     "延长",
     "延長",
     "续期",
     "續期",
+    "擴展",
+    "扩展",
     "Extend",
     "Extend session",
     "Extend Session",
@@ -756,29 +759,33 @@ def try_extend_session(page, cfg, before: dict) -> tuple[bool, dict | None]:
 
     watch_reward_ads(page, cfg, reason="续期广告")
 
-    end = time.time() + 180
+    end = time.time() + 240
     now = None
+    before_exp = before.get("sessionExpiresAt")
+    before_ext = int(before.get("sessionExtensions") or 0)
     while time.time() < end:
         try:
             now = api_state(cfg)
         except Exception:
             now = None
-        if now and (
-            now.get("sessionExtensions", 0) > before.get("sessionExtensions", 0)
-            or now.get("sessionExpiresAt") != before.get("sessionExpiresAt")
-        ):
-            log(
-                "续期成功 → 新到期:",
-                now.get("sessionExpiresAt"),
-                "| 累计:",
-                now.get("sessionExtensions"),
-                "| 今日:",
-                now.get("sessionExtensionsToday"),
-            )
-            return True, now
+        if now:
+            exp = now.get("sessionExpiresAt")
+            ext = int(now.get("sessionExtensions") or 0)
+            # 到期时间变了，或累计续期次数增加
+            if (exp and exp != before_exp) or ext > before_ext:
+                log(
+                    "续期成功 → 新到期:",
+                    exp,
+                    "| 累计:",
+                    ext,
+                    "| 今日:",
+                    now.get("sessionExtensionsToday"),
+                )
+                return True, now
+            log(f"等待续期生效… 到期仍为 {exp} | 累计 {ext}")
         time.sleep(10)
 
-    log("未检测到续期生效（可能今日已满 4 次，或广告未完成）")
+    log("未检测到续期生效（广告可能未核销，或面板/API 限制）")
     return False, now
 
 
@@ -897,36 +904,22 @@ def main():
             else:
                 log("服务器非关机状态，跳过开机步骤")
 
-            # 2) 会话续期（默认总是尝试；可用环境变量跳过）
+            # 2) 会话续期
+            # 注意：API 的 sessionExtensionsToday 可能与面板「今天的擴展 x/4」不一致
+            # 因此不以 API 字段硬跳过；能点到「延伸」就尝试，以续期是否生效为准
             skip_extend = os.environ.get("VOER_SKIP_EXTEND", "").strip() in ("1", "true", "yes")
             try:
                 before = api_state(cfg)
             except Exception:
                 pass
             today_ext = int(before.get("sessionExtensionsToday") or 0)
+            if today_ext >= 4:
+                log(
+                    f"提示: API sessionExtensionsToday={today_ext} "
+                    f"（面板可能仍显示 0/4，将继续尝试点「延伸」）"
+                )
             if skip_extend:
                 log("已设置 VOER_SKIP_EXTEND，跳过续期")
-            elif today_ext >= 4:
-                log("=" * 50)
-                log(f"今日续期次数已达上限（sessionExtensionsToday={today_ext}/4）")
-                log("平台拒绝再续期，需等到下一个 UTC 日 00:00 之后再试")
-                log("当前服务器若为 running，可继续用到 sessionExpiresAt")
-                log("=" * 50)
-                extend_ok = None  # 视为跳过，不是失败
-                after = before
-                shot = take_screenshot(page, "renew_screenshot.png")
-                notify(
-                    cfg,
-                    "ℹ️ Voer 今日续期已满 4 次",
-                    [
-                        f"服务器: <code>{short_id}</code>",
-                        f"状态: {before.get('status')}",
-                        f"到期: {before.get('sessionExpiresAt')}",
-                        f"今日续期: {today_ext}/4（已达上限）",
-                        "请等 UTC 次日 00:00 后再跑续期",
-                    ],
-                    photo=shot,
-                )
             elif power_ok is False and is_stopped(before.get("status")):
                 log("开机未成功且仍为 stopped，跳过续期")
             else:
@@ -975,14 +968,17 @@ def main():
         notify(
             cfg,
             "⚠️ Voer 续期未生效",
-            lines + ["可能: 广告未核销完成 / 今日已达上限 / 会话限制"],
+            lines
+            + [
+                "可能: 广告未完整核销 / 面板显示已满 / 需更长广告时长",
+                "可把 VOER_AD_DURATION_SEC 调到 45 后重试",
+            ],
             photo=shot if shot.exists() else None,
         )
         raise SystemExit(3)
     else:
-        # extend_ok is None：跳过（今日已满或 VOER_SKIP_EXTEND），前面可能已发通知
-        if int(before.get("sessionExtensionsToday") or 0) < 4:
-            notify(cfg, "ℹ️ Voer 任务完成", lines, photo=shot if shot.exists() else None)
+        # 跳过续期（SKIP_EXTEND 或仍为 stopped）
+        notify(cfg, "ℹ️ Voer 任务完成", lines, photo=shot if shot.exists() else None)
 
 
 if __name__ == "__main__":
