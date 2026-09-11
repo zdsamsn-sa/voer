@@ -147,7 +147,6 @@ jobs:
 
           if [ ! -f next_run.txt ] && [ -f renew_output.log ]; then
             grep -oE 'NEXT_RUN_UTC=[0-9T:Z-]+' renew_output.log | tail -1 > next_run.txt || true
-            # 从日志 "cron: M H D m *" 提取
             CRON_LINE=$(grep -oE 'cron: [0-9]+ [0-9]+ [0-9]+ [0-9]+ \*' renew_output.log | tail -1 | sed 's/^cron: //' || true)
             if [ -n "$CRON_LINE" ]; then
               echo "NEXT_RUN_CRON=$CRON_LINE" >> next_run.txt
@@ -191,28 +190,18 @@ jobs:
           if not cron:
               raise SystemExit("no cron in next_run.txt")
 
-          # 只替换 schedule 下的 cron 值
-          pattern = r'(schedule:\s*\n\s*-\s*cron:\s*")([^"]+)(")'
-          new_text, n = re.subn(pattern, r"\g<1>" + cron + r"\g<3>", text, count=1)
-          if n != 1:
-              pattern2 = r"(schedule:\s*\n\s*-\s*cron:\s*')([^']+)(')"
-              new_text, n = re.subn(pattern2, r"\g<1>" + cron + r"\g<3>", text, count=1)
-          if n != 1:
-              raise SystemExit(f"failed to patch cron line, matches={n}")
+          # 匹配 schedule 下的 - cron: "..."（中间可有注释行）
+          pattern = r'(^[ \t]*-[ \t]*cron:[ \t]*")([^"]+)(")([ \t]*#[^\n]*)?'
+          matches = list(re.finditer(pattern, text, flags=re.M))
+          if not matches:
+              pattern = r"(^[ \t]*-[ \t]*cron:[ \t]*')([^']+)(')([ \t]*#[^\n]*)?"
+              matches = list(re.finditer(pattern, text, flags=re.M))
+          if not matches:
+              raise SystemExit("failed to find any cron: line in workflow")
 
-          # 去掉旧的 auto 注释，追加新注释
-          new_text = re.sub(
-              r'(cron:\s*"' + re.escape(cron) + r'")\s*#.*',
-              r'\1',
-              new_text,
-              count=1,
-          )
-          new_text = re.sub(
-              r'(cron:\s*"' + re.escape(cron) + r'")',
-              r'\1  # auto next: ' + (iso or "") + " UTC",
-              new_text,
-              count=1,
-          )
+          m = matches[0]
+          new_line = f'{m.group(1)}{cron}{m.group(3)}  # auto next: {iso or ""} UTC'
+          new_text = text[: m.start()] + new_line + text[m.end():]
 
           if new_text == text:
               print("cron unchanged")
@@ -220,7 +209,8 @@ jobs:
           else:
               wf.write_text(new_text, encoding="utf-8")
               pathlib.Path("/tmp/cron_changed").write_text("1")
-              print("workflow cron updated")
+              print("workflow cron updated to:", cron)
+              print("line:", new_line.strip())
 
           print(f"NEXT_RUN_UTC={iso}")
           print(f"NEXT_RUN_CRON={cron}")
