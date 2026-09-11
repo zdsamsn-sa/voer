@@ -43,7 +43,7 @@ DEFAULT_CONFIG = {
     "server_id": "在这里填服务器 UUID（面板地址 /panel/server/ 后面那串）",
     "token": "在这里填浏览器 Cookie 里 voer.host 的 token 值（JWT）",
     "ads_per_extension": 3,
-    "ad_duration_sec": 40,
+    "ad_duration_sec": 45,
     "headless": False,
     "use_system_chrome": False,
     "telegram_bot_token": "",
@@ -691,111 +691,117 @@ def open_panel(page, url: str):
 
 def watch_reward_ads(page, cfg, reason: str = "广告") -> int:
     """
-    观看激励广告流程（开机 / 续期共用）。
-    UI 实际文案示例：
-      - "Watch 3 ads to start your free server"
-      - "Ad ready."
-      - 绿色按钮 "Watch ad"
-    返回成功处理的广告数量。
+    观看激励广告。以进度条 1/3→2/3→3/3 为准，未涨进度不算成功。
+    优先在 wormies iframe 点击 Watch ad（与开机成功路径一致）。
     """
     total = int(cfg["ads_per_extension"])
     duration = int(cfg["ad_duration_sec"])
-    watched = 0
+    if "续期" in reason:
+        duration = max(duration, 45)
 
-    # 等待广告弹层出现
     ready = wait_for_any_text(
         page,
-        ["Ad ready", "Watch ad", "Watch 3 ads", "Rewarded ad", "觀看廣告", "观看广告"],
+        ["Ad ready", "Watch ad", "Watch 3 ads", "Rewarded ad", "Watch Ads to Extend"],
         45000,
     )
-    if ready:
-        log(f"[{reason}] 检测到广告界面: {ready!r}")
-    else:
-        log(f"[{reason}] 未检测到广告界面文案，仍尝试点击 Watch ad")
+    log(f"[{reason}] 广告界面: {ready!r}")
 
-    progress_before = read_ad_progress(page)
-    log(f"[{reason}] 起始进度: {progress_before or '未知'}")
+    def progress_num() -> int:
+        prog = read_ad_progress(page)
+        if not prog:
+            return -1
+        # "1/3" / "2 / 3"
+        try:
+            return int(prog.replace(" ", "").split("/")[0])
+        except Exception:
+            return -1
+
+    watched = 0
+    log(f"[{reason}] 起始进度: {read_ad_progress(page) or '未知'}")
 
     for i in range(1, total + 1):
-        if i > 1:
-            wait_for_any_text(page, ["Ad ready", "Watch ad", "Rewarded ad"], 60000)
+        before_p = progress_num()
+        # 等 Ad ready
+        wait_for_any_text(page, ["Ad ready", "Watch ad", "Rewarded ad"], 60000)
 
-        # 关键：优先 wormies 帧（开机成功路径），不要只点主站 modal
-        hit = click_watch_ad_prefer_iframe(page, timeout_ms=90000)
-        if not hit:
-            hit = click_anywhere(page, WATCH_AD_LABELS, 30000, exact=False, force=True)
-        if not hit:
-            log(f"[{reason}] 第 {i}/{total} 个 Watch ad 未找到，停止")
-            try:
-                log(f"[{reason}] frames={len(page.frames)}")
-                for fr in page.frames[:15]:
-                    log(f"  frame: {fr.url[:100]}")
-            except Exception:
-                pass
+        # 最多重试 2 次直到进度从 before 涨到 >= i
+        slot_ok = False
+        for attempt in range(1, 3):
+            hit = click_watch_ad_prefer_iframe(page, timeout_ms=60000)
+            if not hit:
+                # 主站点一次，唤起 wormies，再优先 iframe
+                log(f"[{reason}] 第{i}个 尝试{attempt}: iframe 无按钮，点主站 Watch ad 唤起…")
+                click_anywhere(page, WATCH_AD_LABELS, 15000, exact=False, force=True)
+                page.wait_for_timeout(3000)
+                hit = click_watch_ad_prefer_iframe(page, timeout_ms=45000)
+            if not hit:
+                log(f"[{reason}] 第{i}个 尝试{attempt}: 仍未找到 Watch ad")
+                try:
+                    for fr in page.frames[:12]:
+                        log(f"  frame: {(fr.url or '')[:100]}")
+                except Exception:
+                    pass
+                continue
+
+            log(f"[{reason}] 第{i}/{total} 尝试{attempt} 点击: {hit}")
+            # 等广告帧
+            saw = False
+            for _ in range(25):
+                for fr in page.frames:
+                    u = fr.url or ""
+                    if any(k in u for k in ("doubleclick", "googleads", "pagead", "googlesyndication", "wormies")):
+                        if "voer.host/panel" not in u:
+                            log(f"[{reason}] 广告帧: {u[:90]}")
+                            saw = True
+                            break
+                if saw:
+                    break
+                time.sleep(1)
+            if not saw:
+                log(f"[{reason}] 警告: 未出现广告帧")
+
+            log(f"[{reason}] 播放等待 {duration}s…")
+            page.wait_for_timeout(duration * 1000)
+
+            closed = click_close_ad_only(page, timeout_ms=50000)
+            log(
+                f"[{reason}] Close: "
+                + (closed if closed else "无（可能自动关）")
+            )
+
+            # 等进度上涨
+            page.wait_for_timeout(4000)
+            advanced = False
+            for _ in range(25):
+                pnow = progress_num()
+                if pnow >= i:
+                    advanced = True
+                    log(f"[{reason}] 进度已到 {pnow}/3（目标>={i}）")
+                    break
+                if pnow > before_p and before_p >= 0:
+                    advanced = True
+                    log(f"[{reason}] 进度 {before_p} → {pnow}")
+                    break
+                time.sleep(1)
+            if advanced:
+                slot_ok = True
+                watched = max(watched, progress_num() if progress_num() >= 0 else i)
+                break
+            log(f"[{reason}] 第{i}个 尝试{attempt}: 进度未涨（仍为 {progress_num()}），重试")
+            page.wait_for_timeout(2000)
+
+        if not slot_ok:
+            log(f"[{reason}] 第 {i} 个广告未能核销，停止后续")
             break
 
-        log(f"[{reason}] 已点击第 {i}/{total} 个 Watch ad（{hit}），等待广告帧…")
-        ad_frame_deadline = time.time() + 30
-        saw_ad_frame = False
-        while time.time() < ad_frame_deadline:
-            for fr in page.frames:
-                u = fr.url or ""
-                if any(k in u for k in ("wormies", "doubleclick", "googleads", "pagead", "googlesyndication")):
-                    saw_ad_frame = True
-                    log(f"[{reason}] 广告帧: {u[:90]}")
-                    break
-            if saw_ad_frame:
-                break
-            time.sleep(1.0)
-        if not saw_ad_frame:
-            log(f"[{reason}] 警告: 无 googleads/wormies 帧，核销可能失败")
-
-        # 续期广告往往更长；可被环境变量覆盖
-        wait_sec = duration
-        if "续期" in reason:
-            wait_sec = max(duration, 40)
-        log(f"[{reason}] 播放等待 {wait_sec}s…")
-        page.wait_for_timeout(wait_sec * 1000)
-
-        closed = click_close_ad_only(page, timeout_ms=60000)
-        log(
-            f"[{reason}] 第 {i} 个广告: "
-            + (f"已关闭（{closed}）" if closed else "未找到 iframe Close（可能自动关）")
-        )
-
-        # 用进度条判断是否真正核销（0/3 → 1/3 → 2/3）
         page.wait_for_timeout(3000)
-        prog = None
-        for _ in range(20):
-            prog = read_ad_progress(page)
-            if prog and prog not in ("0/3", "0 / 3"):
-                # 期望第 i 个完成后至少 i/3
-                break
-            time.sleep(1.0)
-        log(f"[{reason}] 当前进度: {prog or '未知'}")
-        if prog in (f"{i}/3", f"{i} / 3") or (prog and prog[0].isdigit() and int(prog[0]) >= i):
-            watched += 1
-            log(f"[{reason}] 第 {i} 个广告核销成功")
-        else:
-            # 有 Close 也先计一次，但仍可能未核销
-            if closed:
-                watched += 1
-                log(f"[{reason}] 第 {i} 个广告已关但进度未明确增加，仍继续")
-            else:
-                log(f"[{reason}] 第 {i} 个广告可能未核销，继续尝试")
-                watched += 1  # 仍推进，避免卡死
 
-        page.wait_for_timeout(4000)
-        nxt = wait_for_any_text(
-            page,
-            ["Ad ready", "Watch ad", "Rewarded ad", "1 / 3", "2 / 3", "3 / 3"],
-            45000,
-        )
-        if nxt:
-            log(f"[{reason}] 下一轮界面: {nxt!r}")
+    final_p = progress_num()
+    log(f"[{reason}] 结束进度: {read_ad_progress(page) or '未知'} | 计为完成格数≈{watched}")
+    if final_p >= total:
+        return total
+    return max(0, final_p) if final_p >= 0 else watched
 
-    log(f"[{reason}] 本轮共处理 {watched}/{total} 个广告")
-    return watched
 
 
 def wait_until_running(cfg, timeout_sec=120) -> dict | None:
@@ -888,7 +894,9 @@ def try_extend_session(page, cfg, before: dict) -> tuple[bool, dict | None]:
     log(f"已点击续期入口: {hit}")
     page.wait_for_timeout(2500)
 
-    watch_reward_ads(page, cfg, reason="续期广告")
+    n = watch_reward_ads(page, cfg, reason="续期广告")
+    if n < int(cfg["ads_per_extension"]):
+        log(f"续期广告未满 {cfg['ads_per_extension']} 个（完成约 {n}），仍等待接口是否生效…")
 
     end = time.time() + 240
     now = None
