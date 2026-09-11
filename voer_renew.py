@@ -257,6 +257,57 @@ def notify(cfg, title: str, lines: list, photo: pathlib.Path | None = None):
 # ---------------------------------------------------------------------------
 # Config / API
 # ---------------------------------------------------------------------------
+
+def write_next_run(session_expires_at: str | None, lead_minutes: int = 45) -> str | None:
+    """
+    根据会话到期时间，计算下次应运行的 UTC 时间（默认提前 45 分钟）。
+    写入 next_run.txt，并打印 NEXT_RUN_UTC=... 供 workflow 解析。
+    返回 ISO 时间字符串或 None。
+    """
+    import datetime
+
+    if not session_expires_at:
+        log("无 sessionExpiresAt，无法计算下次运行时间")
+        return None
+    try:
+        s = session_expires_at.strip().replace("Z", "+00:00")
+        exp = datetime.datetime.fromisoformat(s)
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=datetime.timezone.utc)
+        exp_utc = exp.astimezone(datetime.timezone.utc)
+    except Exception as e:
+        log(f"解析到期时间失败: {e}")
+        return None
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    next_run = exp_utc - datetime.timedelta(minutes=lead_minutes)
+    # 若已经过了「提前量」，则改为 10 分钟后跑（避免立刻重复）
+    if next_run <= now:
+        next_run = now + datetime.timedelta(minutes=10)
+
+    # 对齐到整分钟
+    next_run = next_run.replace(second=0, microsecond=0)
+    iso = next_run.strftime("%Y-%m-%dT%H:%M:%SZ")
+    # cron: 分 时 日 月 *
+    cron = f"{next_run.minute} {next_run.hour} {next_run.day} {next_run.month} *"
+
+    line = f"NEXT_RUN_UTC={iso}"
+    print(line, flush=True)
+    log(f"下次运行时间 (UTC): {iso}  | cron: {cron}")
+    log(f"会话到期 (UTC): {exp_utc.strftime('%Y-%m-%dT%H:%M:%SZ')}  | 提前 {lead_minutes} 分钟")
+
+    out = pathlib.Path("next_run.txt")
+    content = (
+        f"NEXT_RUN_UTC={iso}\n"
+        f"NEXT_RUN_CRON={cron}\n"
+        f"SESSION_EXPIRES_AT={exp_utc.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+        f"LEAD_MINUTES={lead_minutes}\n"
+    )
+    out.write_text(content, encoding="utf-8")
+    log(f"已写入 {out.resolve()}")
+    return iso
+
+
 def _jwt_hint(token: str) -> str:
     t = (token or "").strip()
     if not t:
@@ -957,6 +1008,12 @@ def main():
                 if only_power:
                     shot = take_screenshot(page, "renew_screenshot.png")
                     if power_ok:
+                        exp = (after or before).get("sessionExpiresAt")
+                        try:
+                            lead = int(os.environ.get("VOER_NEXT_RUN_LEAD_MINUTES", "45"))
+                        except Exception:
+                            lead = 45
+                        write_next_run(exp, lead_minutes=lead)
                         notify(
                             cfg,
                             "✅ Voer 开机成功",
@@ -1043,6 +1100,11 @@ def main():
         lines.insert(1, "开机: 未确认成功")
 
     if extend_ok is True:
+        try:
+            lead = int(os.environ.get("VOER_NEXT_RUN_LEAD_MINUTES", "45"))
+        except Exception:
+            lead = 45
+        write_next_run(final.get("sessionExpiresAt"), lead_minutes=lead)
         notify(cfg, "✅ Voer 续期成功", lines, photo=shot)
     elif extend_ok is False:
         notify(
@@ -1057,7 +1119,13 @@ def main():
         )
         raise SystemExit(3)
     else:
-        # 跳过续期（SKIP_EXTEND 或仍为 stopped）
+        # 跳过续期：若已在跑且有到期时间，仍写入下次运行
+        if final.get("sessionExpiresAt") and is_running(final.get("status")):
+            try:
+                lead = int(os.environ.get("VOER_NEXT_RUN_LEAD_MINUTES", "45"))
+            except Exception:
+                lead = 45
+            write_next_run(final.get("sessionExpiresAt"), lead_minutes=lead)
         notify(cfg, "ℹ️ Voer 任务完成", lines, photo=shot if shot.exists() else None)
 
 
