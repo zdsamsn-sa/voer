@@ -43,7 +43,7 @@ DEFAULT_CONFIG = {
     "server_id": "在这里填服务器 UUID（面板地址 /panel/server/ 后面那串）",
     "token": "在这里填浏览器 Cookie 里 voer.host 的 token 值（JWT）",
     "ads_per_extension": 3,
-    "ad_duration_sec": 35,
+    "ad_duration_sec": 40,
     "headless": False,
     "use_system_chrome": False,
     "telegram_bot_token": "",
@@ -518,6 +518,63 @@ def click_close_ad_only(page, timeout_ms=60000):
     return None
 
 
+
+def click_watch_ad_prefer_iframe(page, timeout_ms=90000):
+    """优先在 wormies / 广告 iframe 里点 Watch ad（续期核销关键），再回退到主页面。"""
+    labels = WATCH_AD_LABELS
+    deadline = time.time() + timeout_ms / 1000
+    while time.time() < deadline:
+        frames = list(page.frames)
+        # 1) 优先广告帧
+        ordered = sorted(
+            frames,
+            key=lambda f: (0 if _is_ad_frame_url(f.url) and "voer.host/panel" not in (f.url or "") else 1),
+        )
+        for frame in ordered:
+            for t in labels:
+                makers = [
+                    lambda t=t, f=frame: f.get_by_role("button", name=t, exact=False).first,
+                    lambda t=t, f=frame: f.get_by_text(t, exact=False).first,
+                    lambda t=t, f=frame: f.locator(f"button:has-text('{t}')").first,
+                    lambda t=t, f=frame: f.locator(f"[role=button]:has-text('{t}')").first,
+                ]
+                for maker in makers:
+                    try:
+                        loc = maker()
+                        if not loc.count():
+                            continue
+                        try:
+                            visible = loc.is_visible()
+                        except Exception:
+                            visible = False
+                        if not visible:
+                            continue
+                        loc.click(timeout=4000)
+                        return f"{t}@{frame.url[:80]}"
+                    except Exception:
+                        try:
+                            loc.evaluate("el => el.click()")
+                            return f"{t}@js:{frame.url[:60]}"
+                        except Exception:
+                            pass
+        time.sleep(1.0)
+    return None
+
+
+def read_ad_progress(page) -> str | None:
+    """读取弹窗进度文案，如 '1 / 3'、'2/3'。"""
+    patterns = ["1 / 3", "2 / 3", "3 / 3", "1/3", "2/3", "3/3", "0 / 3", "0/3"]
+    for frame in page.frames:
+        for t in patterns:
+            try:
+                loc = frame.get_by_text(t, exact=False).first
+                if loc.count() and loc.is_visible():
+                    return t.replace(" ", "")
+            except Exception:
+                pass
+    return None
+
+
 def dismiss_banners(page):
     for t in ACCEPT_LABELS:
         hit = click_anywhere(page, [t], 2500)
@@ -605,63 +662,86 @@ def watch_reward_ads(page, cfg, reason: str = "广告") -> int:
     else:
         log(f"[{reason}] 未检测到广告界面文案，仍尝试点击 Watch ad")
 
+    progress_before = read_ad_progress(page)
+    log(f"[{reason}] 起始进度: {progress_before or '未知'}")
+
     for i in range(1, total + 1):
-        # 每一轮先等 Ad ready（除了可能已经 ready）
         if i > 1:
             wait_for_any_text(page, ["Ad ready", "Watch ad", "Rewarded ad"], 60000)
 
-        hit = click_anywhere(page, WATCH_AD_LABELS, 90000, exact=False)
+        # 关键：优先 wormies 帧（开机成功路径），不要只点主站 modal
+        hit = click_watch_ad_prefer_iframe(page, timeout_ms=90000)
         if not hit:
-            # 强制再试一轮（有的节点 visible 判定失败）
             hit = click_anywhere(page, WATCH_AD_LABELS, 30000, exact=False, force=True)
         if not hit:
             log(f"[{reason}] 第 {i}/{total} 个 Watch ad 未找到，停止")
-            # 打印当前 frames 帮助诊断
             try:
-                log(f"[{reason}] 当前 frames 数: {len(page.frames)}")
-                for fr in page.frames[:12]:
-                    log(f"  frame: {fr.url[:90]}")
+                log(f"[{reason}] frames={len(page.frames)}")
+                for fr in page.frames[:15]:
+                    log(f"  frame: {fr.url[:100]}")
             except Exception:
                 pass
             break
 
-        log(f"[{reason}] 已点击第 {i}/{total} 个 Watch ad（{hit}），等待广告 iframe 加载…")
-        # 等 wormies / googleads 等广告帧出现（奖励核销依赖真实广告播放）
-        ad_frame_deadline = time.time() + 25
+        log(f"[{reason}] 已点击第 {i}/{total} 个 Watch ad（{hit}），等待广告帧…")
+        ad_frame_deadline = time.time() + 30
         saw_ad_frame = False
         while time.time() < ad_frame_deadline:
             for fr in page.frames:
-                if _is_ad_frame_url(fr.url) and "voer.host/panel" not in (fr.url or ""):
-                    if "wormies" in fr.url or "doubleclick" in fr.url or "googleads" in fr.url or "pagead" in fr.url:
-                        saw_ad_frame = True
-                        log(f"[{reason}] 广告帧已出现: {fr.url[:80]}")
-                        break
+                u = fr.url or ""
+                if any(k in u for k in ("wormies", "doubleclick", "googleads", "pagead", "googlesyndication")):
+                    saw_ad_frame = True
+                    log(f"[{reason}] 广告帧: {u[:90]}")
+                    break
             if saw_ad_frame:
                 break
             time.sleep(1.0)
         if not saw_ad_frame:
-            log(f"[{reason}] 警告: 未检测到 googleads/wormies 广告帧，奖励可能无法核销")
+            log(f"[{reason}] 警告: 无 googleads/wormies 帧，核销可能失败")
 
-        log(f"[{reason}] 播放等待 {duration}s…")
-        page.wait_for_timeout(duration * 1000)
+        # 续期广告往往更长；可被环境变量覆盖
+        wait_sec = duration
+        if "续期" in reason:
+            wait_sec = max(duration, 40)
+        log(f"[{reason}] 播放等待 {wait_sec}s…")
+        page.wait_for_timeout(wait_sec * 1000)
 
-        # 只在广告 iframe 内关，避免关掉主弹窗
-        closed = click_close_ad_only(page, timeout_ms=50000)
+        closed = click_close_ad_only(page, timeout_ms=60000)
         log(
             f"[{reason}] 第 {i} 个广告: "
-            + (f"已关闭（{closed}）" if closed else "未找到广告 iframe Close（可能自动关闭）")
+            + (f"已关闭（{closed}）" if closed else "未找到 iframe Close（可能自动关）")
         )
-        watched += 1
-        page.wait_for_timeout(5000)
+
+        # 用进度条判断是否真正核销（0/3 → 1/3 → 2/3）
+        page.wait_for_timeout(3000)
+        prog = None
+        for _ in range(20):
+            prog = read_ad_progress(page)
+            if prog and prog not in ("0/3", "0 / 3"):
+                # 期望第 i 个完成后至少 i/3
+                break
+            time.sleep(1.0)
+        log(f"[{reason}] 当前进度: {prog or '未知'}")
+        if prog in (f"{i}/3", f"{i} / 3") or (prog and prog[0].isdigit() and int(prog[0]) >= i):
+            watched += 1
+            log(f"[{reason}] 第 {i} 个广告核销成功")
+        else:
+            # 有 Close 也先计一次，但仍可能未核销
+            if closed:
+                watched += 1
+                log(f"[{reason}] 第 {i} 个广告已关但进度未明确增加，仍继续")
+            else:
+                log(f"[{reason}] 第 {i} 个广告可能未核销，继续尝试")
+                watched += 1  # 仍推进，避免卡死
+
+        page.wait_for_timeout(4000)
         nxt = wait_for_any_text(
             page,
-            ["Ad ready", "Watch ad", "Rewarded ad", "1 / 3", "2 / 3", "3 / 3", "1/3", "2/3", "3/3"],
-            60000,
+            ["Ad ready", "Watch ad", "Rewarded ad", "1 / 3", "2 / 3", "3 / 3"],
+            45000,
         )
         if nxt:
             log(f"[{reason}] 下一轮界面: {nxt!r}")
-        else:
-            log(f"[{reason}] 等待下一轮广告界面超时（若已是最后一轮可忽略）")
 
     log(f"[{reason}] 本轮共处理 {watched}/{total} 个广告")
     return watched
