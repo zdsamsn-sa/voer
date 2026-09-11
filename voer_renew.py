@@ -622,22 +622,38 @@ def watch_reward_ads(page, cfg, reason: str = "广告") -> int:
                 pass
             break
 
-        log(f"[{reason}] 已点击第 {i}/{total} 个 Watch ad（{hit}），播放中 {duration}s…")
+        log(f"[{reason}] 已点击第 {i}/{total} 个 Watch ad（{hit}），等待广告 iframe 加载…")
+        # 等 wormies / googleads 等广告帧出现（奖励核销依赖真实广告播放）
+        ad_frame_deadline = time.time() + 25
+        saw_ad_frame = False
+        while time.time() < ad_frame_deadline:
+            for fr in page.frames:
+                if _is_ad_frame_url(fr.url) and "voer.host/panel" not in (fr.url or ""):
+                    if "wormies" in fr.url or "doubleclick" in fr.url or "googleads" in fr.url or "pagead" in fr.url:
+                        saw_ad_frame = True
+                        log(f"[{reason}] 广告帧已出现: {fr.url[:80]}")
+                        break
+            if saw_ad_frame:
+                break
+            time.sleep(1.0)
+        if not saw_ad_frame:
+            log(f"[{reason}] 警告: 未检测到 googleads/wormies 广告帧，奖励可能无法核销")
+
+        log(f"[{reason}] 播放等待 {duration}s…")
         page.wait_for_timeout(duration * 1000)
 
-        # 重要：绝不能点主页面弹窗右上角 Close，否则会中断整个 3 次广告流程
-        closed = click_close_ad_only(page, timeout_ms=45000)
+        # 只在广告 iframe 内关，避免关掉主弹窗
+        closed = click_close_ad_only(page, timeout_ms=50000)
         log(
             f"[{reason}] 第 {i} 个广告: "
             + (f"已关闭（{closed}）" if closed else "未找到广告 iframe Close（可能自动关闭）")
         )
         watched += 1
-        # 等下一轮 Ad ready / Watch ad 出现
-        page.wait_for_timeout(4000)
+        page.wait_for_timeout(5000)
         nxt = wait_for_any_text(
             page,
-            ["Ad ready", "Watch ad", "Rewarded ad", "Watch 3 ads"],
-            50000,
+            ["Ad ready", "Watch ad", "Rewarded ad", "1 / 3", "2 / 3", "3 / 3", "1/3", "2/3", "3/3"],
+            60000,
         )
         if nxt:
             log(f"[{reason}] 下一轮界面: {nxt!r}")
@@ -890,8 +906,29 @@ def main():
             today_ext = int(before.get("sessionExtensionsToday") or 0)
             if skip_extend:
                 log("已设置 VOER_SKIP_EXTEND，跳过续期")
-            elif power_ok is False and today_ext >= 4:
-                log("开机未成功且今日续期已达上限，跳过续期步骤（避免无效点击）")
+            elif today_ext >= 4:
+                log("=" * 50)
+                log(f"今日续期次数已达上限（sessionExtensionsToday={today_ext}/4）")
+                log("平台拒绝再续期，需等到下一个 UTC 日 00:00 之后再试")
+                log("当前服务器若为 running，可继续用到 sessionExpiresAt")
+                log("=" * 50)
+                extend_ok = None  # 视为跳过，不是失败
+                after = before
+                shot = take_screenshot(page, "renew_screenshot.png")
+                notify(
+                    cfg,
+                    "ℹ️ Voer 今日续期已满 4 次",
+                    [
+                        f"服务器: <code>{short_id}</code>",
+                        f"状态: {before.get('status')}",
+                        f"到期: {before.get('sessionExpiresAt')}",
+                        f"今日续期: {today_ext}/4（已达上限）",
+                        "请等 UTC 次日 00:00 后再跑续期",
+                    ],
+                    photo=shot,
+                )
+            elif power_ok is False and is_stopped(before.get("status")):
+                log("开机未成功且仍为 stopped，跳过续期")
             else:
                 extend_ok, after = try_extend_session(page, cfg, before)
 
@@ -935,13 +972,17 @@ def main():
     if extend_ok is True:
         notify(cfg, "✅ Voer 续期成功", lines, photo=shot)
     elif extend_ok is False:
-        notify(cfg, "⚠️ Voer 续期未生效", lines + ["可能: 广告未完成 / 今日已达上限"], photo=shot if shot.exists() else None)
-        # 若开机成功但续期失败，仍给非 0，方便 Actions 标黄/红
-        if power_ok is not True:
-            raise SystemExit(3)
+        notify(
+            cfg,
+            "⚠️ Voer 续期未生效",
+            lines + ["可能: 广告未核销完成 / 今日已达上限 / 会话限制"],
+            photo=shot if shot.exists() else None,
+        )
+        raise SystemExit(3)
     else:
-        # 只跑了开机分支以外且跳过续期
-        notify(cfg, "ℹ️ Voer 任务完成", lines, photo=shot if shot.exists() else None)
+        # extend_ok is None：跳过（今日已满或 VOER_SKIP_EXTEND），前面可能已发通知
+        if int(before.get("sessionExtensionsToday") or 0) < 4:
+            notify(cfg, "ℹ️ Voer 任务完成", lines, photo=shot if shot.exists() else None)
 
 
 if __name__ == "__main__":
