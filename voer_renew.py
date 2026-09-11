@@ -258,6 +258,35 @@ def notify(cfg, title: str, lines: list, photo: pathlib.Path | None = None):
 # Config / API
 # ---------------------------------------------------------------------------
 
+
+def _should_skip_extend_for_now(state: dict) -> bool:
+    """若仍在 running 且距离到期超过 lead+缓冲，则跳过续期。"""
+    import datetime
+    if not is_running(state.get("status")):
+        return False
+    exp_s = state.get("sessionExpiresAt")
+    if not exp_s:
+        return False
+    try:
+        lead = int(os.environ.get("VOER_NEXT_RUN_LEAD_MINUTES", "45"))
+    except Exception:
+        lead = 45
+    # 额外缓冲 15 分钟：只在到期前 lead+15 分钟内才真正看广告续期
+    window = lead + 15
+    try:
+        s = str(exp_s).strip().replace("Z", "+00:00")
+        exp = datetime.datetime.fromisoformat(s)
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        left_min = (exp.astimezone(datetime.timezone.utc) - now).total_seconds() / 60.0
+        log(f"距离到期约 {left_min:.0f} 分钟（窗口={window} 分钟内才续期）")
+        return left_min > window
+    except Exception as e:
+        log(f"解析到期时间失败，不跳过: {e}")
+        return False
+
+
 def write_next_run(session_expires_at: str | None, lead_minutes: int = 45) -> str | None:
     """
     根据会话到期时间，计算下次应运行的 UTC 时间（默认提前 45 分钟）。
