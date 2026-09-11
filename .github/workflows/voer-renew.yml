@@ -1,7 +1,16 @@
+# Voer.host 免费服务器自动续期
+#
+# Secrets（Settings → Secrets and variables → Actions）:
+#   VOER_SERVER_ID         必须
+#   VOER_TOKEN             必须
+#   TELEGRAM_BOT_TOKEN     可选
+#   TELEGRAM_CHAT_ID       可选
+#
+# 还需要: Settings → Actions → General → Workflow permissions → Read and write
+
 name: Voer.host 会话续期
 
 on:
-  # 手动触发（Actions 页面点 Run workflow）
   workflow_dispatch:
     inputs:
       mode:
@@ -10,26 +19,25 @@ on:
         default: "renew"
         type: choice
         options:
-          - renew      # 开机(如需) + 续期（看广告）
-          - power-on   # 只尝试开机（关机时；可能看广告）
-          - status     # 只查看当前状态，不消耗广告次数
+          - renew
+          - power-on
+          - status
 
-  # 定时任务（UTC 时间）
-  # 建议每天跑 2～3 次，避开高峰，且不超过每日 4 次上限
   schedule:
-    - cron: "0 0,8,16 * * *"   # 每天 00:00 / 08:00 / 16:00 UTC
-    # 如果想改成更少次数，可改成：
-    # - cron: "0 2,14 * * *"   # 每天两次
+    # 会被「更新下次运行 Cron」步骤按 session 到期时间自动改写
+    - cron: "0 0,8,16 * * *"
 
-# 同一时间只允许一个任务跑，防止重复续期
 concurrency:
   group: voer-renew
   cancel-in-progress: false
 
+permissions:
+  contents: write
+
 jobs:
   renew:
     runs-on: ubuntu-latest
-    timeout-minutes: 15          # 正常 3～5 分钟，给足缓冲
+    timeout-minutes: 20
 
     steps:
       - name: 检出代码
@@ -44,7 +52,7 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: 安装系统依赖（虚拟显示 + 字体）
+      - name: 安装系统依赖
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq xvfb fonts-liberation libnss3 libatk-bridge2.0-0 \
@@ -58,10 +66,9 @@ jobs:
           pip install -r requirements.txt
 
       - name: 安装 Playwright Chromium
-        run: |
-          playwright install chromium --with-deps
+        run: playwright install chromium --with-deps
 
-      - name: 检查 Secrets 是否已配置
+      - name: 检查 Secrets
         env:
           VOER_SERVER_ID: ${{ secrets.VOER_SERVER_ID }}
           VOER_TOKEN: ${{ secrets.VOER_TOKEN }}
@@ -69,53 +76,27 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           if [ -z "$VOER_SERVER_ID" ] || [ -z "$VOER_TOKEN" ]; then
-            echo "❌ 缺少 Secrets！"
-            echo "请到仓库 Settings → Secrets and variables → Actions 添加："
-            echo "  VOER_SERVER_ID = 你的服务器 UUID"
-            echo "  VOER_TOKEN     = Cookie 里的 token（JWT）"
-            echo ""
-            echo "获取方法见本文件顶部注释，或 README.md"
+            echo "缺少 VOER_SERVER_ID 或 VOER_TOKEN"
             exit 1
           fi
-          # 只打印长度和开头，不泄露完整 secret
-          echo "✅ 必要 Secrets 已配置"
-          echo "  VOER_SERVER_ID 长度=${#VOER_SERVER_ID}, 开头=${VOER_SERVER_ID:0:8}..."
-          echo "  VOER_TOKEN     长度=${#VOER_TOKEN}, 开头=${VOER_TOKEN:0:8}..."
-          DOTS=$(echo -n "$VOER_TOKEN" | tr -cd '.' | wc -c)
-          echo "  VOER_TOKEN 中 . 的数量=$DOTS（标准 JWT 应为 2）"
-          if [[ ! "$VOER_TOKEN" == eyJ* ]]; then
-            echo "⚠️  警告：正常 JWT 一般以 eyJ 开头，当前开头异常，可能复制错了"
-          fi
-          if [ "$DOTS" -ne 2 ]; then
-            echo "⚠️  警告：标准 JWT 应有 2 个点（3 段），当前点数=$DOTS，可能复制不完整"
-          fi
-          # Telegram（可选）
-          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
-            echo "ℹ️  Telegram 未完整配置（将跳过 TG 通知）"
-            echo "   需要同时存在这两个 Repository secrets（名称必须完全一致）："
-            echo "     TELEGRAM_BOT_TOKEN  长度=${#TELEGRAM_BOT_TOKEN}"
-            echo "     TELEGRAM_CHAT_ID    长度=${#TELEGRAM_CHAT_ID}"
-            echo "   Settings → Secrets and variables → Actions → New repository secret"
+          echo "VOER_SERVER_ID len=${#VOER_SERVER_ID}"
+          echo "VOER_TOKEN len=${#VOER_TOKEN}"
+          if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+            echo "Telegram: configured"
           else
-            echo "✅ Telegram 已配置"
-            echo "  TELEGRAM_BOT_TOKEN 长度=${#TELEGRAM_BOT_TOKEN}, 开头=${TELEGRAM_BOT_TOKEN:0:6}..."
-            echo "  TELEGRAM_CHAT_ID   长度=${#TELEGRAM_CHAT_ID}, 值开头=${TELEGRAM_CHAT_ID:0:4}..."
+            echo "Telegram: not configured (optional)"
           fi
 
-      - name: 只查看状态（不消耗广告）
+      - name: 只查看状态
         if: github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'status'
         env:
           VOER_SERVER_ID: ${{ secrets.VOER_SERVER_ID }}
           VOER_TOKEN: ${{ secrets.VOER_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          xvfb-run -a python3 voer_renew.py --status
+        run: xvfb-run -a python3 voer_renew.py --status
 
-
-
-      - name: 执行续期（看 3 个广告）
-        id: renew
+      - name: 执行续期
         if: |
           github.event_name == 'schedule' ||
           (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'renew')
@@ -125,13 +106,9 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           VOER_NEXT_RUN_LEAD_MINUTES: "45"
-          # VOER_ADS_PER_EXTENSION: "3"
-          # VOER_AD_DURATION_SEC: "45"
         run: |
-          echo "开始续期，预计 3～5 分钟..."
           set -o pipefail
           xvfb-run -a python3 voer_renew.py 2>&1 | tee renew_output.log
-          echo "脚本执行完毕，请查看上方日志是否显示「续期成功」"
 
       - name: 只尝试开机
         if: github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'power-on'
@@ -142,11 +119,10 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           VOER_NEXT_RUN_LEAD_MINUTES: "45"
         run: |
-          echo "尝试开机（若已运行则跳过）..."
           set -o pipefail
           xvfb-run -a python3 voer_renew.py --power-on 2>&1 | tee renew_output.log
 
-      - name: 上传失败截图（如有）
+      - name: 上传截图
         if: failure()
         uses: actions/upload-artifact@v4
         with:
@@ -156,108 +132,112 @@ jobs:
             renew_screenshot.png
           if-no-files-found: ignore
 
-      - name: 续期后再次确认状态
-        if: always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (github.event.inputs.mode == 'renew' || github.event.inputs.mode == 'power-on')))
+      - name: 再次确认状态
+        if: always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'status'))
         env:
           VOER_SERVER_ID: ${{ secrets.VOER_SERVER_ID }}
           VOER_TOKEN: ${{ secrets.VOER_TOKEN }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          echo "----- 当前服务器状态 -----"
-          xvfb-run -a python3 voer_renew.py --status || true
+        run: xvfb-run -a python3 voer_renew.py --status || true
 
-      - name: 更新下次运行 Cron（根据到期时间）
+      - name: 更新下次运行 Cron
         if: success()
         run: |
           set -e
           WF=".github/workflows/voer-renew.yml"
-          if [ ! -f next_run.txt ]; then
-            # 尝试从日志解析
-            if [ -f renew_output.log ]; then
-              grep -o 'NEXT_RUN_UTC=[0-9T:Z-]*' renew_output.log | tail -1 > next_run.txt || true
-              CRON_LINE=$(grep -o 'cron: [0-9* ].*' renew_output.log | tail -1 | sed 's/.*cron: //' || true)
-              if [ -n "$CRON_LINE" ]; then
-                echo "NEXT_RUN_CRON=$CRON_LINE" >> next_run.txt
-              fi
+
+          if [ ! -f next_run.txt ] && [ -f renew_output.log ]; then
+            grep -oE 'NEXT_RUN_UTC=[0-9T:Z-]+' renew_output.log | tail -1 > next_run.txt || true
+            # 从日志 "cron: M H D m *" 提取
+            CRON_LINE=$(grep -oE 'cron: [0-9]+ [0-9]+ [0-9]+ [0-9]+ \*' renew_output.log | tail -1 | sed 's/^cron: //' || true)
+            if [ -n "$CRON_LINE" ]; then
+              echo "NEXT_RUN_CRON=$CRON_LINE" >> next_run.txt
             fi
           fi
+
           if [ ! -f next_run.txt ]; then
-            echo "无 next_run.txt，跳过 cron 更新（可能未续期成功或无到期时间）"
+            echo "无 next_run.txt，跳过 cron 更新"
             exit 0
           fi
+
           echo "----- next_run.txt -----"
           cat next_run.txt
-          NEXT_RUN_UTC=$(grep '^NEXT_RUN_UTC=' next_run.txt | cut -d= -f2)
-          NEXT_RUN_CRON=$(grep '^NEXT_RUN_CRON=' next_run.txt | cut -d= -f2)
+
+          NEXT_RUN_UTC=$(grep '^NEXT_RUN_UTC=' next_run.txt | head -1 | cut -d= -f2- | tr -d '\r')
+          NEXT_RUN_CRON=$(grep '^NEXT_RUN_CRON=' next_run.txt | head -1 | cut -d= -f2- | tr -d '\r')
+
           if [ -z "$NEXT_RUN_UTC" ] || [ -z "$NEXT_RUN_CRON" ]; then
             echo "NEXT_RUN 字段不完整，跳过"
             exit 0
           fi
-          echo "下次运行时间 (UTC): $NEXT_RUN_UTC"
+
+          echo "下次运行 UTC: $NEXT_RUN_UTC"
           echo "新 cron: $NEXT_RUN_CRON"
 
-          # 替换 schedule 里的 cron 行（保留 workflow_dispatch）
-          python3 - <<'PY'
-          import pathlib, re
+          python3 << 'PY'
+          import pathlib
+          import re
+
           wf = pathlib.Path(".github/workflows/voer-renew.yml")
           text = wf.read_text(encoding="utf-8")
           nxt = pathlib.Path("next_run.txt").read_text(encoding="utf-8")
-          cron = None
-          iso = None
+
+          cron = iso = None
           for line in nxt.splitlines():
               if line.startswith("NEXT_RUN_CRON="):
                   cron = line.split("=", 1)[1].strip()
               if line.startswith("NEXT_RUN_UTC="):
                   iso = line.split("=", 1)[1].strip()
+
           if not cron:
-              raise SystemExit("no cron")
-          # 替换第一个 schedule cron
-          new_text, n = re.subn(
-              r'(schedule:\s*
-\s*-\s*cron:\s*")([^"]+)(")',
-              lambda m: f'{m.group(1)}{cron}{m.group(3)}',
-              text,
-              count=1,
-          )
+              raise SystemExit("no cron in next_run.txt")
+
+          # 只替换 schedule 下的 cron 值
+          pattern = r'(schedule:\s*\n\s*-\s*cron:\s*")([^"]+)(")'
+          new_text, n = re.subn(pattern, r"\g<1>" + cron + r"\g<3>", text, count=1)
           if n != 1:
-              # 尝试 YAML 单引号
-              new_text, n = re.subn(
-                  r"(schedule:\s*
-\s*-\s*cron:\s*')([^']+)(')",
-                  lambda m: f"{m.group(1)}{cron}{m.group(3)}",
-                  text,
-                  count=1,
-              )
+              pattern2 = r"(schedule:\s*\n\s*-\s*cron:\s*')([^']+)(')"
+              new_text, n = re.subn(pattern2, r"\g<1>" + cron + r"\g<3>", text, count=1)
           if n != 1:
-              raise SystemExit(f"failed to patch cron, n={n}")
-          # 在 cron 行后加注释
+              raise SystemExit(f"failed to patch cron line, matches={n}")
+
+          # 去掉旧的 auto 注释，追加新注释
           new_text = re.sub(
-              r'(-\s*cron:\s*"' + re.escape(cron) + r'")',
-              r'   # auto: next run ' + (iso or "") + " UTC",
+              r'(cron:\s*"' + re.escape(cron) + r'")\s*#.*',
+              r'\1',
               new_text,
               count=1,
           )
+          new_text = re.sub(
+              r'(cron:\s*"' + re.escape(cron) + r'")',
+              r'\1  # auto next: ' + (iso or "") + " UTC",
+              new_text,
+              count=1,
+          )
+
           if new_text == text:
-              print("cron 未变化，无需提交")
+              print("cron unchanged")
               pathlib.Path("/tmp/cron_changed").write_text("0")
           else:
               wf.write_text(new_text, encoding="utf-8")
               pathlib.Path("/tmp/cron_changed").write_text("1")
-              print("已写入新 cron 到", wf)
-          print("找到工作流文件:", wf)
-          print(f"[auto] 下次执行时间: {iso} UTC")
-          print(f"新 cron: {cron}")
+              print("workflow cron updated")
+
+          print(f"NEXT_RUN_UTC={iso}")
+          print(f"NEXT_RUN_CRON={cron}")
           PY
 
           if [ "$(cat /tmp/cron_changed 2>/dev/null || echo 0)" != "1" ]; then
             echo "无需推送"
             exit 0
           fi
+
           git config user.name "voer-renew-bot"
           git config user.email "voer-renew-bot@users.noreply.github.com"
           git add "$WF"
-          git diff --cached --quiet && echo "无变更" && exit 0
-          git commit -m "chore: 自动更新下次续期 cron → ${NEXT_RUN_UTC}"
+          if git diff --cached --quiet; then
+            echo "无变更"
+            exit 0
+          fi
+          git commit -m "chore: auto cron next run ${NEXT_RUN_UTC}"
           git push
-          echo "✅ Cron 已自动更新并推送"
+          echo "Cron 已推送"
