@@ -1067,6 +1067,15 @@ def main():
                 log("已设置 VOER_SKIP_EXTEND，跳过续期")
             elif power_ok is False and is_stopped(before.get("status")):
                 log("开机未成功且仍为 stopped，跳过续期")
+            elif _should_skip_extend_for_now(before):
+                log("距离到期仍较远，跳过本次续期（避免无意义看广告）")
+                extend_ok = None
+                after = before
+                try:
+                    lead = int(os.environ.get("VOER_NEXT_RUN_LEAD_MINUTES", "45"))
+                except Exception:
+                    lead = 45
+                write_next_run(before.get("sessionExpiresAt"), lead_minutes=lead)
             else:
                 extend_ok, after = try_extend_session(page, cfg, before)
 
